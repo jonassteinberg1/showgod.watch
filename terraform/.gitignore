@@ -1,0 +1,6 @@
+# python
+.venv
+
+# terraform
+.terraform
+terraform.tfstate*

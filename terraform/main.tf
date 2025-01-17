@@ -11,15 +11,6 @@ data "aws_availability_zones" "available" {
   }
 }
 
-locals {
-  cluster_name = "showgod-watch-eks-${random_string.suffix.result}"
-}
-
-resource "random_string" "suffix" {
-  length  = 8
-  special = false
-}
-
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.17.0"
@@ -45,55 +36,162 @@ module "vpc" {
   }
 }
 
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "20.31.6"
+resource "aws_eks_cluster" "cluster" {
+  name = "showgod-watch-eks-cluster"
 
-  cluster_name    = local.cluster_name
-  cluster_version = "1.32"
-
-  cluster_endpoint_public_access           = true
-  enable_cluster_creator_admin_permissions = true
-
-  cluster_addons = {
-    aws-ebs-csi-driver = {
-      service_account_role_arn = module.irsa-ebs-csi.iam_role_arn
-    }
+  access_config {
+    authentication_mode = "API"
   }
 
-  vpc_id     = module.vpc.vpc_id
+  role_arn = aws_iam_role.cluster.arn
+  version  = "1.31"
+
+  vpc_config {
+    subnet_ids = concat(module.vpc.private_subnets, module.vpc.public_subnets)
+  }
+
+  # Ensure that IAM Role permissions are created before and deleted
+  # after EKS Cluster handling. Otherwise, EKS will not be able to
+  # properly delete EKS managed EC2 infrastructure such as Security Groups.
+  depends_on = [
+    aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy,
+  ]
+}
+
+# role for nodegroup
+
+resource "aws_iam_role" "nodes" {
+  name = "showgod-watch-eks-cluster-nodes"
+
+  assume_role_policy = jsonencode({
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+    Version = "2012-10-17"
+  })
+}
+
+# IAM policy attachment to node group
+
+resource "aws_iam_role_policy_attachment" "nodes-AmazonEKSWorkerNodePolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "nodes-AmazonEKS_CNI_Policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "nodes-AmazonEC2ContainerRegistryReadOnly" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.nodes.name
+}
+
+
+# aws node group 
+
+resource "aws_eks_node_group" "private-nodes" {
+  cluster_name    = aws_eks_cluster.cluster.name
+  node_group_name = "showgod-watch-eks-cluster-private-nodes"
+  node_role_arn   = aws_iam_role.nodes.arn
+
   subnet_ids = module.vpc.private_subnets
 
-  eks_managed_node_group_defaults = {
-    ami_type = "CUSTOM"
+  capacity_type  = "ON_DEMAND"
+  instance_types = ["t3.small"]
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 2
+    min_size     = 0
   }
 
-  eks_managed_node_groups = {
-    one = {
-      name = "showgod-watch-ng-1"
-      ami_id = "ami-0689d81543aa65690"
-      instance_types = ["t3.small"]
-
-      min_size     = 1
-      max_size     = 3
-      desired_size = 2
-    }
+  update_config {
+    max_unavailable = 1
   }
+
+  labels = {
+    node = "kubenode02"
+  }
+
+  # taint {
+  #   key    = "team"
+  #   value  = "devops"
+  #   effect = "NO_SCHEDULE"
+  # }
+
+  launch_template {
+    name    = aws_launch_template.eks-with-disks.name
+    version = aws_launch_template.eks-with-disks.latest_version
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.nodes-AmazonEKSWorkerNodePolicy,
+    aws_iam_role_policy_attachment.nodes-AmazonEKS_CNI_Policy,
+    aws_iam_role_policy_attachment.nodes-AmazonEC2ContainerRegistryReadOnly,
+  ]
 }
 
+# launch template if required
+
+resource "aws_launch_template" "eks-with-disks" {
+  name = "eks-with-disks"
+
+  image_id = "ami-0689d81543aa65690"
+
+  #key_name = "local-provisioner"
+
+  #block_device_mappings {
+  #  device_name = "/dev/xvdb"
+
+  #  ebs {
+  #    volume_size = 50
+  #    volume_type = "gp2"
+  #  }
+  #}
+}
+
+resource "aws_iam_role" "cluster" {
+  name = "showgod-watch-eks-cluster-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "sts:AssumeRole",
+          "sts:TagSession"
+        ]
+        Effect = "Allow"
+        Principal = {
+          Service = "eks.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.cluster.name
+}
 
 # https://aws.amazon.com/blogs/containers/amazon-ebs-csi-driver-is-now-generally-available-in-amazon-eks-add-ons/ 
-data "aws_iam_policy" "ebs_csi_policy" {
-  arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
-}
-
-module "irsa-ebs-csi" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
-  version = "5.52.1"
-
-  create_role                   = true
-  role_name                     = "AmazonEKSTFEBSCSIRole-${module.eks.cluster_name}"
-  provider_url                  = module.eks.oidc_provider
-  role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
-  oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
-}
+#data "aws_iam_policy" "ebs_csi_policy" {
+#  arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+#}
+#
+#module "irsa-ebs-csi" {
+#  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+#  version = "5.52.1"
+#
+#  create_role                   = true
+#  role_name                     = "AmazonEKSTFEBSCSIRole-${module.eks.cluster_name}"
+#  provider_url                  = module.eks.oidc_provider
+#  role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
+#  oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+#}
